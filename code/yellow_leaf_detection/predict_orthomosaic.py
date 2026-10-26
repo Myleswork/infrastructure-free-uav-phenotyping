@@ -1,8 +1,8 @@
 
-import os
+import json
 import numpy as np
 import cv2
-from PIL import Image, ImageDraw
+from PIL import Image
 import torch
 from tqdm import tqdm
 import pickle
@@ -142,21 +142,6 @@ def generate_plant_mask(image_rgb, sam_ckpt, min_component=500, max_dim=1024):
         plant_mask = mask_small
     return plant_mask
 
-model_path = "SegVeg_data/model_scikit"
-model_SVM = pickle.load(Path(model_path).open("rb"))
-
-# load the original model (from published SegVeg paper) but optimized through XGBoost (same data, but reduced computational time)
-model_path = "SegVeg_data/XGBoost"
-model_XG = pickle.load(Path(model_path).open("rb"))
-new_attrs = ['grow_policy', 'max_bin', 'eval_metric', 'callbacks', 'early_stopping_rounds', 'max_cat_to_onehot', 'max_leaves', 'sampling_method', 'enable_categorical', 'feature_types', 'max_cat_threshold', 'predictor']
-for attr in new_attrs:
-    setattr(model_XG, attr, None)
-
-# load the original model (from published SegVeg paper) but improved thanks to Jonas Anderegg et al. work.
-# no more confusion between chlorosis-yellow and necrosis-brown
-model_path = "SegVeg_data/Necrosis.pkl"
-model_Necrosis = pickle.load(Path(model_path).open("rb"))
-
 # get features from rectangle_fields.py
 def get_features(image):
     pil_image = Image.fromarray(image)
@@ -200,6 +185,9 @@ def prediction_XG_SVM(image, model, threshold, contrasted, mask):
     height, width = image.shape[:2]
     if mask is None:
         mask = np.ones((height, width))
+    _validate_mask(mask, (height, width), "plant_mask")
+    if not np.any(mask > 0):
+        return np.zeros((height, width), dtype=np.uint8), np.zeros((height, width), dtype=np.float32)
     image = image.reshape((width*height), 1, 3)
     mask = mask.reshape((width*height), 1)
     yellow_green_mask = np.zeros(image.shape[:-1])
@@ -219,7 +207,7 @@ def prediction_XG_SVM(image, model, threshold, contrasted, mask):
 # visualize necrosis and yellow leaf detection
 def visualisation_Necrosis(rgb_image: np.ndarray, yg_mask: np.ndarray, stg) -> np.ndarray:
     """
-    take rgb image and yellow_green_mask and apply color
+    Legacy visualization: both input and returned image use OpenCV BGR.
     """
     image_copy = rgb_image.copy()
 
@@ -247,6 +235,11 @@ def visualisation_Necrosis(rgb_image: np.ndarray, yg_mask: np.ndarray, stg) -> n
 
 # split big image into tiles with overlap
 def tile_image(img, tile_size=1024, overlap=64):
+    _validate_rgb_image(img)
+    if not isinstance(tile_size, int) or tile_size <= 0:
+        raise ValueError("tile_size must be a positive integer")
+    if not isinstance(overlap, int) or not 0 <= overlap < tile_size:
+        raise ValueError("overlap must be an integer with 0 <= overlap < tile_size")
     h, w = img.shape[:2]
     tiles = []
     for y in range(0, h, tile_size - overlap):
@@ -259,59 +252,197 @@ def tile_image(img, tile_size=1024, overlap=64):
 
 # stitch tiled predictions back into full-size array
 def stitch_tiles(tiles, shape):
+    if len(shape) != 2 or any(not isinstance(d, (int, np.integer)) or d <= 0 for d in shape):
+        raise ValueError(f"Invalid stitching shape: {shape}; expected positive (height, width)")
     H, W = shape
     out = np.zeros((H, W), dtype=np.uint8)
     for (y1, y2, x1, x2), tile_mask in tiles:
+        if not (0 <= y1 < y2 <= H and 0 <= x1 < x2 <= W):
+            raise ValueError(f"Invalid tile coordinates {(y1, y2, x1, x2)} for shape {shape}")
+        _validate_mask(tile_mask, (y2 - y1, x2 - x1), "tile_mask")
         out[y1:y2, x1:x2] = np.maximum(out[y1:y2, x1:x2], tile_mask)
     return out
 
+
+def _validate_rgb_image(image_rgb):
+    if (not isinstance(image_rgb, np.ndarray) or image_rgb.ndim != 3
+            or image_rgb.shape[2] != 3 or image_rgb.size == 0
+            or image_rgb.dtype != np.uint8):
+        raise ValueError("image_rgb must be a nonempty uint8 RGB image with shape (height, width, 3)")
+
+
+def _validate_mask(mask, shape, name):
+    if not isinstance(mask, np.ndarray) or mask.ndim != 2 or mask.shape != tuple(shape) or mask.size == 0:
+        raise ValueError(f"{name} must be a nonempty 2D mask with shape {tuple(shape)}; "
+                         f"got {getattr(mask, 'shape', None)}")
+
+
+def summarize_masks(plant_mask, final_mask, image_name):
+    """Count stitched SAM vegetation separately from final post-HSV classes."""
+    if not isinstance(final_mask, np.ndarray) or final_mask.ndim != 2 or final_mask.size == 0:
+        raise ValueError("final_mask must be a nonempty 2D classification mask")
+    _validate_mask(plant_mask, final_mask.shape, "plant_mask")
+    if not np.all(np.isin(plant_mask, [0, 1, 255])):
+        raise ValueError("plant_mask must contain only binary values 0/1 or 0/255")
+    if not np.all(np.isin(final_mask, [0, 1, 2])):
+        raise ValueError("final_mask must contain only classes 0 (other), 1 (green), 2 (senescent)")
+    height, width = final_mask.shape
+    total = int(final_mask.size)
+    sam_pixels = int(np.count_nonzero(plant_mask))
+    green = int(np.count_nonzero(final_mask == 1))
+    yellow = int(np.count_nonzero(final_mask == 2))
+    classified = green + yellow
+    return {
+        "image_name": Path(image_name).name,
+        "image_width": width,
+        "image_height": height,
+        "total_pixels": total,
+        "sam_vegetation_pixels": sam_pixels,
+        "green_pixels": green,
+        "yellow_pixels": yellow,
+        "other_pixels": total - classified,
+        "valid_classified_vegetation_pixels": classified,
+        "vegetation_coverage_percent": 100.0 * sam_pixels / total,
+        "yellow_ratio_percent": 100.0 * yellow / classified if classified else 0.0,
+        "metric_definitions": {
+            "sam_vegetation_pixels": "Nonzero pixels in the stitched generate_plant_mask output, copied before SegVeg classification; includes existing SAM mask postprocessing.",
+            "green_pixels": "Pixels with final stitched class 1 after the existing HSV filter.",
+            "yellow_pixels": "Pixels with final stitched class 2 (senescent vegetation) after the existing HSV filter.",
+            "other_pixels": "total_pixels - green_pixels - yellow_pixels; includes background and vegetation removed by the HSV filter.",
+            "vegetation_coverage_percent": "100 * sam_vegetation_pixels / total_pixels.",
+            "yellow_ratio_percent": "100 * yellow_pixels / (green_pixels + yellow_pixels); 0.0 when the denominator is zero (no valid classified vegetation).",
+        },
+        "stitching_policy": "Existing np.maximum: SAM masks merge by union; final class 2 overrides class 1 in overlaps, which can bias yellow statistics upward.",
+        "hsv_filter_behavior": "Preserved existing call: RGB tile passed to hsv_filter_senescent, whose conversion is COLOR_BGR2HSV; thresholds unchanged. The current filter uses only S/V, which are invariant to swapping red and blue.",
+        "interpretation": "Model output pixel statistics only; not measured disease incidence or true growth abnormality rate. No physical area is estimated.",
+    }
+
+
+def create_abnormal_overlay(image_rgb, yellow_mask, alpha=0.5):
+    """Blend RGB red only onto selected pixels; leave every other pixel exact."""
+    _validate_rgb_image(image_rgb)
+    _validate_mask(yellow_mask, image_rgb.shape[:2], "yellow_mask")
+    if not 0 <= alpha <= 1:
+        raise ValueError("alpha must be between 0 and 1")
+    selected = yellow_mask > 0
+    overlay = image_rgb.copy()
+    overlay[selected] = np.rint(
+        (1 - alpha) * image_rgb[selected] + alpha * np.array([255, 0, 0])
+    ).astype(np.uint8)
+    return overlay
+
+
+def save_diagnostic_outputs(image_rgb, plant_mask, final_mask, image_name, out_dir):
+    """Export full-resolution diagnostics, the legacy visualization and JSON."""
+    _validate_rgb_image(image_rgb)
+    _validate_mask(final_mask, image_rgb.shape[:2], "final_mask")
+    stats = summarize_masks(plant_mask, final_mask, image_name)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    yellow_mask = (final_mask == 2).astype(np.uint8) * 255
+    Image.fromarray((plant_mask > 0).astype(np.uint8) * 255).save(out_dir / "plant_mask.png")
+    Image.fromarray(yellow_mask).save(out_dir / "yellow_mask.png")
+    Image.fromarray(create_abnormal_overlay(image_rgb, yellow_mask)).save(out_dir / "abnormal_overlay.png")
+
+    # The legacy palette and addWeighted operate in BGR; Pillow saves RGB.
+    visu, _, _ = visualisation_Necrosis(
+        cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR), final_mask, "SegVeg_XG_SVM")
+    Image.fromarray(cv2.cvtColor(visu, cv2.COLOR_BGR2RGB)).save(out_dir / "Disease Detection.png")
+    with (out_dir / "summary.json").open("w", encoding="utf-8") as stream:
+        json.dump(stats, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+
+    print(f"\n模型识别结果统计: {stats['image_name']}")
+    print(f"影像尺寸: {stats['image_width']} × {stats['image_height']}; 总像素: {stats['total_pixels']:,}")
+    print(f"SAM 植被像素（分类前独立掩膜）: {stats['sam_vegetation_pixels']:,}")
+    print(f"最终绿色像素（类别 1）: {stats['green_pixels']:,}")
+    print(f"最终黄化/衰老像素（类别 2，HSV 后）: {stats['yellow_pixels']:,}")
+    print(f"其他像素（含 HSV 剔除像素）: {stats['other_pixels']:,}")
+    print(f"SAM 植被覆盖比例（SAM 植被 / 总像素）: {stats['vegetation_coverage_percent']:.4f}%")
+    print(f"黄化比例（黄化 / 最终绿色与黄化像素之和 = {stats['valid_classified_vegetation_pixels']:,}）: "
+          f"{stats['yellow_ratio_percent']:.4f}%")
+    if not stats["valid_classified_vegetation_pixels"]:
+        print("最终有效分类植被像素为 0，黄化比例按 0.0% 输出。")
+    print("统计保留 np.maximum 拼接规则：重叠区类别 2 优先于类别 1，可能增加黄化计数。")
+    print("以上仅为模型输出像素统计，不代表真实病害发生率或长势异常率；未估算实际面积。")
+    print(f"Saved diagnostic outputs to {out_dir.resolve()}")
+    return stats
+
+
 # main segmentation pipeline for orthomosaic
 def segveg_on_orthomosaic(orthomosaic_path, sam_ckpt, model_XG, out_dir, tile_size=1024, overlap=64):
-    os.makedirs(out_dir, exist_ok=True)
-
-    pad_px = 200  # you can change this value as needed
-    orig_img = cv2.imread(orthomosaic_path, cv2.IMREAD_COLOR)
+    if not Path(orthomosaic_path).is_file():
+        raise FileNotFoundError(f"Input image not found: {Path(orthomosaic_path).resolve()}")
+    orig_img = cv2.imread(str(orthomosaic_path), cv2.IMREAD_COLOR)
+    if orig_img is None or orig_img.size == 0:
+        raise ValueError(f"Unable to read input image or image is empty: {Path(orthomosaic_path).resolve()}")
+    if not Path(sam_ckpt).is_file():
+        raise FileNotFoundError(f"SAM checkpoint not found: {Path(sam_ckpt).resolve()}")
     orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
-    H, W = orig_img.shape[:2]
 
     # step 1: tile orthomosaic
     tiles, shape = tile_image(orig_img, tile_size=tile_size, overlap=overlap)
 
     stitched_masks = []
-    stitched_probs = []
+    stitched_plant_masks = []
 
     for (y1, y2, x1, x2), tile in tqdm(tiles, desc="Processing tiles"):
         # plant mask
         plant_mask = generate_plant_mask(tile, sam_ckpt)
+        _validate_mask(plant_mask, tile.shape[:2], "plant_mask")
+        # prediction_XG_SVM mutates mask through a reshape view. Preserve SAM first.
+        stitched_plant_masks.append(((y1, y2, x1, x2), plant_mask.copy()))
 
         # SegVeg classification
-        yg_mask, prob_map = prediction_XG_SVM(
+        yg_mask, _ = prediction_XG_SVM(
             cv2.cvtColor(tile, cv2.COLOR_RGB2BGR),
             model_XG,
             threshold=0.8,
             contrasted=1,
             mask=plant_mask
         )
+        # Preserve existing RGB input to this BGR-based filter for identical labels.
         yg_mask = hsv_filter_senescent(tile, yg_mask)
 
         stitched_masks.append(((y1, y2, x1, x2), yg_mask))
-        stitched_probs.append(((y1, y2, x1, x2), (prob_map*255).astype(np.uint8)))
 
     # step 2: stitch results back
     full_mask = stitch_tiles(stitched_masks, shape)
+    full_plant_mask = stitch_tiles(stitched_plant_masks, shape)
 
-    # step 3: save overlay visualization only (no .tif files)
-    base_name = os.path.splitext(os.path.basename(orthomosaic_path))[0]
-    visu, _, _ = visualisation_Necrosis(orig_img, full_mask, "SegVeg_XG_SVM")
-    overlay_path = os.path.join(out_dir, f"Disease Detection.png")
-    Image.fromarray(cv2.cvtColor(visu, cv2.COLOR_BGR2RGB)).save(overlay_path, format="PNG")
-    print(f"Saved overlay to {overlay_path}")
+    return save_diagnostic_outputs(orig_img, full_plant_mask, full_mask, orthomosaic_path, out_dir)
 
-segveg_on_orthomosaic(
-    orthomosaic_path="orthomosaic.png",
-    sam_ckpt="sam_vit_b.pth",
-    model_XG=model_XG,
-    out_dir="results/",
-    tile_size=2048,
-    overlap=256
-)
+
+def main():
+    # Keep the original pickle loading sequence and XGBoost compatibility attributes.
+    model_paths = ["SegVeg_data/model_scikit", "SegVeg_data/XGBoost", "SegVeg_data/Necrosis.pkl"]
+    for model_path in model_paths:
+        if not Path(model_path).is_file():
+            raise FileNotFoundError(f"Model file not found: {Path(model_path).resolve()}")
+    model_path = "SegVeg_data/model_scikit"
+    with Path(model_path).open("rb") as stream:
+        model_SVM = pickle.load(stream)
+
+    model_path = "SegVeg_data/XGBoost"
+    with Path(model_path).open("rb") as stream:
+        model_XG = pickle.load(stream)
+    new_attrs = ['grow_policy', 'max_bin', 'eval_metric', 'callbacks', 'early_stopping_rounds', 'max_cat_to_onehot', 'max_leaves', 'sampling_method', 'enable_categorical', 'feature_types', 'max_cat_threshold', 'predictor']
+    for attr in new_attrs:
+        setattr(model_XG, attr, None)
+
+    model_path = "SegVeg_data/Necrosis.pkl"
+    with Path(model_path).open("rb") as stream:
+        model_Necrosis = pickle.load(stream)
+
+    segveg_on_orthomosaic(
+        orthomosaic_path="data/2025-08-27/Full Orthomosaic (10 meter).png",
+        sam_ckpt="code/yellow_leaf_detection/weights/sam_vit_b.pth",
+        model_XG=model_XG,
+        out_dir="results/",
+        tile_size=2048,
+        overlap=256
+    )
+
+
+if __name__ == "__main__":
+    main()

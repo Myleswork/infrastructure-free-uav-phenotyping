@@ -1,0 +1,102 @@
+# ============================================================
+# Python / Machine Learning / UAV imagery project
+# ============================================================
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+
+# Build / package artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Tests, type checking, linting and coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+.cache/
+
+# Local experiment outputs (adjust to your project)
+outputs/
+output/
+runs/
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+
+# ------------------------------------------------------------
+# Optional for drone imagery / model training: uncomment only
+# if these are local artifacts that should NOT be versioned.
+# Do not blindly ignore data/ or *.pt/*.tif: the upstream repo
+# includes example datasets and model weights that may need Git.
+# ------------------------------------------------------------
+# data/raw/
+# data/processed/
+# checkpoints/
+# weights/
+# *.pt
+# *.pth
+# *.onnx
+# *.tif
+# *.tiff
+# *.las
+# *.laz
+
+SegVeg_data/
+*.pth
+results/
+SegVeg_data.zip
+data/2025-08-27/Full Orthomosaic (10 meter).png
